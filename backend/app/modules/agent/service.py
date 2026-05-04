@@ -1,4 +1,5 @@
-from typing import Dict, Any, List
+import re
+from typing import Dict, Any, List, Optional
 
 from openai import (
     RateLimitError,
@@ -31,7 +32,11 @@ class AgentService:
             max_retries=2,
         )
 
-        self.extractor = self.model.with_structured_output(UserIntentExtraction)
+        self.extractor = self.model.with_structured_output(
+            UserIntentExtraction,
+            method="function_calling",
+            include_raw=False,
+        )
 
         self.tools = [
             create_cal_booking,
@@ -43,7 +48,7 @@ class AgentService:
             "list_cal_bookings_by_email": list_cal_bookings_by_email,
         }
 
-        # Demo memory. Production should use Redis/database.
+        # Demo memory. Production should use Redis or database.
         self.pending_bookings: Dict[str, Dict[str, Any]] = {}
         self.pending_lists: Dict[str, Dict[str, Any]] = {}
 
@@ -56,19 +61,54 @@ class AgentService:
                 self.pending_lists.pop(session_id, None)
                 return "Okay, I cancelled the current unfinished flow."
 
-            if session_id in self.pending_bookings and extraction.action != "list_bookings":
-                return self._handle_create_booking_flow(session_id, extraction)
+            # 1. If user is already in booking flow, keep collecting booking info.
+            # Only switch to list flow if the user explicitly asks to list/show/check meetings.
+            if session_id in self.pending_bookings:
+                if self._is_explicit_list_request(user_message):
+                    self.pending_bookings.pop(session_id, None)
+                    return self._handle_list_bookings_flow(
+                        session_id=session_id,
+                        extraction=extraction,
+                        raw_message=user_message,
+                    )
 
-            if session_id in self.pending_lists and extraction.action != "create_booking":
-                return self._handle_list_bookings_flow(session_id, extraction)
+                return self._handle_create_booking_flow(
+                    session_id=session_id,
+                    extraction=extraction,
+                    raw_message=user_message,
+                )
 
+            # 2. If user is already in list flow, keep collecting email.
+            # Only switch to booking flow if the user explicitly starts a booking request.
+            if session_id in self.pending_lists:
+                if extraction.action == "create_booking":
+                    self.pending_lists.pop(session_id, None)
+                    return self._handle_create_booking_flow(
+                        session_id=session_id,
+                        extraction=extraction,
+                        raw_message=user_message,
+                    )
+
+                return self._handle_list_bookings_flow(
+                    session_id=session_id,
+                    extraction=extraction,
+                    raw_message=user_message,
+                )
+
+            # 3. No pending flow yet. Start based on extracted intent.
             if extraction.action == "create_booking":
-                self.pending_lists.pop(session_id, None)
-                return self._handle_create_booking_flow(session_id, extraction)
+                return self._handle_create_booking_flow(
+                    session_id=session_id,
+                    extraction=extraction,
+                    raw_message=user_message,
+                )
 
             if extraction.action == "list_bookings":
-                self.pending_bookings.pop(session_id, None)
-                return self._handle_list_bookings_flow(session_id, extraction)
+                return self._handle_list_bookings_flow(
+                    session_id=session_id,
+                    extraction=extraction,
+                    raw_message=user_message,
+                )
 
             return (
                 "I can help you book a meeting or list scheduled meetings. "
@@ -114,19 +154,19 @@ class AgentService:
         self,
         session_id: str,
         extraction: UserIntentExtraction,
+        raw_message: str = "",
     ) -> str:
         current_state = self.pending_bookings.get(session_id, {})
 
         extracted_data = {
             "name": extraction.name,
-            "email": extraction.email,
-            "date": extraction.date,
-            "time": extraction.time,
+            "email": extraction.email or self._extract_email_fallback(raw_message),
+            "date": extraction.date or self._extract_date_fallback(raw_message),
+            "time": extraction.time or self._extract_time_fallback(raw_message),
             "timezone": extraction.timezone,
             "reason": extraction.reason,
         }
 
-        # Merge new info. This supports correction.
         for key, value in extracted_data.items():
             if value:
                 current_state[key] = value
@@ -140,7 +180,9 @@ class AgentService:
 
         if missing_fields:
             return self._ask_for_missing_booking_fields(current_state, missing_fields)
-
+        
+        print("CURRENT BOOKING STATE:", current_state)
+        
         result = self._run_tool(
             tool_name="create_cal_booking",
             tool_args={
@@ -152,20 +194,34 @@ class AgentService:
                 "timezone": current_state["timezone"],
             },
         )
+        
+        # Only clear pending booking if booking succeeds.
+        if "Booking created successfully" in result:
+            self.pending_bookings.pop(session_id, None)
+            return result
 
-        self.pending_bookings.pop(session_id, None)
+        # If booking fails, keep the existing information.
+        # User can provide a new date or time without re-entering everything.
+        self.pending_bookings[session_id] = current_state
 
-        return result
+        return (
+            f"{result}\n\n"
+            "The booking was not completed. I kept your previous information, "
+            "so you can just provide a new date or time."
+        )
 
     def _handle_list_bookings_flow(
         self,
         session_id: str,
         extraction: UserIntentExtraction,
+        raw_message: str = "",
     ) -> str:
         current_state = self.pending_lists.get(session_id, {})
 
-        if extraction.email:
-            current_state["email"] = extraction.email
+        email = extraction.email or self._extract_email_fallback(raw_message)
+
+        if email:
+            current_state["email"] = email
 
         self.pending_lists[session_id] = current_state
 
@@ -179,9 +235,19 @@ class AgentService:
             },
         )
 
-        self.pending_lists.pop(session_id, None)
+        # If bookings are found, finish the list flow.
+        if "Found" in result and "booking(s)" in result:
+            self.pending_lists.pop(session_id, None)
+            return result
 
-        return result
+        # If no bookings found or lookup failed, keep the list flow.
+        # This lets user provide another email without restarting.
+        self.pending_lists[session_id] = current_state
+
+        return (
+            f"{result}\n\n"
+            "You can provide another email address if you want me to check a different account."
+        )
 
     def _get_missing_booking_fields(self, state: Dict[str, Any]) -> List[str]:
         required_fields = ["name", "email", "date", "time", "reason"]
@@ -242,6 +308,69 @@ class AgentService:
             return str(tool_result.content)
 
         return str(tool_result)
+
+    def _extract_email_fallback(self, text: str) -> Optional[str]:
+        match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text)
+        return match.group(0) if match else None
+    
+    def _extract_date_fallback(self, text: str) -> Optional[str]:
+        match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+        return match.group(0) if match else None
+
+
+    def _extract_time_fallback(self, text: str) -> Optional[str]:
+        text_lower = text.lower()
+
+        # Match 1pm, 1 pm, 1:30pm, 1:30 pm
+        match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text_lower)
+
+        if match:
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0)
+            period = match.group(3)
+
+            if period == "pm" and hour != 12:
+                hour += 12
+            elif period == "am" and hour == 12:
+                hour = 0
+
+            return f"{hour:02d}:{minute:02d}"
+
+        # Match 13:00, 09:30
+        match_24 = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text_lower)
+
+        if match_24:
+            hour = int(match_24.group(1))
+            minute = int(match_24.group(2))
+            return f"{hour:02d}:{minute:02d}"
+
+        return None
+    
+    def _is_explicit_list_request(self, user_message: str) -> bool:
+        text = user_message.lower()
+
+        explicit_list_phrases = [
+            "show my",
+            "show all",
+            "show meetings",
+            "show scheduled",
+            "list my",
+            "list all",
+            "list meetings",
+            "list scheduled",
+            "check my schedule",
+            "check the schedule",
+            "check scheduled",
+            "view my",
+            "view meetings",
+            "view scheduled",
+            "scheduled meetings",
+            "scheduled events",
+            "my bookings",
+            "my meetings",
+        ]
+
+        return any(phrase in text for phrase in explicit_list_phrases)
 
 
 agent_service = AgentService()

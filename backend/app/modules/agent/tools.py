@@ -1,7 +1,7 @@
 from typing import Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
+import json
 from langchain.tools import tool
 
 from app.core.config import settings
@@ -55,11 +55,23 @@ def create_cal_booking(
         result = cal_service.create_booking(booking_request)
 
         if not result.get("success"):
-            return (
-                "Failed to create booking.\n"
-                f"Reason: {result.get('message')}\n"
-                f"Details: {result.get('data')}"
-            )
+            data = result.get("data", {})
+            error_text = data.get("error")
+
+            clean_message = result.get("message", "Failed to create booking.")
+
+            if error_text:
+                try:
+                    error_json = json.loads(error_text)
+                    clean_message = (
+                        error_json
+                        .get("error", {})
+                        .get("message", clean_message)
+                    )
+                except Exception:
+                    clean_message = error_text
+
+            return clean_message
 
         data = result.get("data", {})
         booking_data = data.get("data", {})
@@ -89,11 +101,23 @@ def list_cal_bookings_by_email(email: str) -> str:
         result = cal_service.list_bookings(email=email)
 
         if not result.get("success"):
-            return (
-                "Failed to fetch bookings.\n"
-                f"Reason: {result.get('message')}\n"
-                f"Details: {result.get('data')}"
-            )
+            data = result.get("data", {})
+            error_text = data.get("error")
+
+            clean_message = result.get("message", "Failed to create booking.")
+
+            if error_text:
+                try:
+                    error_json = json.loads(error_text)
+                    clean_message = (
+                        error_json
+                        .get("error", {})
+                        .get("message", clean_message)
+                    )
+                except Exception:
+                    clean_message = error_text
+
+            return clean_message
 
         bookings = result.get("bookings", [])
 
@@ -115,7 +139,7 @@ def list_cal_bookings_by_email(email: str) -> str:
 
             lines.append(
                 "\n"
-                f"{index}. {booking.title or 'Untitled booking'}\n"
+                f"{index}. Meeting with {attendee_text or email}\n"
                 f"   UID: {booking.uid}\n"
                 f"   Status: {booking.status}\n"
                 f"   Start: {booking.start}\n"
